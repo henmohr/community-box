@@ -1,0 +1,288 @@
+# Hardware Compatibility Testing Environment for ARM64
+# Based on research/guides/hardware-compatibility-check.md
+
+FROM debian:bookworm-slim
+
+# Set non-interactive frontend for apt
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install core system utilities and hardware testing tools
+RUN apt-get update && apt-get install -y \
+    # Basic utilities
+    bash \
+    coreutils \
+    procps \
+    util-linux \
+    # Hardware detection and monitoring
+    lshw \
+    dmidecode \
+    pciutils \
+    usbutils \
+    lm-sensors \
+    # CPU testing
+    stress \
+    stress-ng \
+    cpuid \
+    # Memory testing
+    memtester \
+    # Storage testing
+    smartmontools \
+    hdparm \
+    fio \
+    # Network testing
+    ethtool \
+    net-tools \
+    iputils-ping \
+    iperf3 \
+    iproute2 \
+    # Performance monitoring
+    sysstat \
+    htop \
+    # Additional tools
+    file \
+    grep \
+    sed \
+    gawk \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create working directory for test scripts and results
+WORKDIR /tests
+
+# Copy the hardware detection script from the guide
+COPY <<'EOF' /tests/hardware-check.sh
+#!/bin/bash
+# Automated hardware compatibility check
+# Based on research/guides/hardware-compatibility-check.md
+
+echo "=== Hardware Compatibility Check ==="
+echo "Date: $(date)"
+echo
+
+echo "=== CPU Information ==="
+lscpu | grep -E "(Model name|Architecture|CPU MHz|Core|Thread)"
+echo
+
+echo "=== Memory Information ==="
+free -h
+echo
+dmidecode --type memory 2>/dev/null | grep -E "(Size|Speed|Type):" || echo "dmidecode requires root access"
+echo
+
+echo "=== Storage Information ==="
+lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
+echo
+df -h
+echo
+
+echo "=== Network Information ==="
+ip link show
+echo
+for iface in $(ls /sys/class/net/ | grep -v lo); do
+    echo "Interface: $iface"
+    ethtool "$iface" 2>/dev/null | grep -E "(Speed|Duplex)" || echo "  ethtool requires root access"
+done
+echo
+
+echo "=== PCIe Information ==="
+lspci 2>/dev/null | grep -E "(VGA|Ethernet|SATA|USB|Network)" || echo "lspci requires root access"
+echo
+
+echo "=== USB Information ==="
+lsusb 2>/dev/null || echo "lsusb requires root access"
+echo
+
+echo "=== Temperature Information ==="
+sensors 2>/dev/null || echo "Sensors not configured. Run 'sensors-detect' as root."
+echo
+
+echo "=== System Load ==="
+uptime
+echo
+EOF
+
+# Create CPU stress test script
+COPY <<'EOF' /tests/cpu-stress-test.sh
+#!/bin/bash
+# CPU stress testing script
+
+DURATION=${1:-1800}  # Default 30 minutes
+CORES=$(nproc)
+
+echo "=== CPU Stress Test ==="
+echo "Duration: ${DURATION} seconds"
+echo "CPU Cores: ${CORES}"
+echo "Start time: $(date)"
+echo
+
+stress -c ${CORES} -t ${DURATION} &
+STRESS_PID=$!
+
+# Monitor temperatures during stress
+echo "Monitoring CPU during stress test..."
+for i in $(seq 1 $((DURATION/10))); do
+    echo "--- Check $i ($(date)) ---"
+    sensors 2>/dev/null | grep -E "(Core|Package)" || echo "Temperature monitoring unavailable"
+    sleep 10
+done
+
+wait ${STRESS_PID}
+echo
+echo "End time: $(date)"
+echo "=== Stress Test Complete ==="
+EOF
+
+# Create memory test script
+COPY <<'EOF' /tests/memory-test.sh
+#!/bin/bash
+# Memory testing script
+
+MEMORY_MB=${1:-1024}  # Default 1GB
+ITERATIONS=${2:-5}    # Default 5 iterations
+
+echo "=== Memory Test ==="
+echo "Testing: ${MEMORY_MB}MB"
+echo "Iterations: ${ITERATIONS}"
+echo "Start time: $(date)"
+echo
+
+memtester ${MEMORY_MB}M ${ITERATIONS}
+
+echo
+echo "End time: $(date)"
+echo "=== Memory Test Complete ==="
+EOF
+
+# Create storage test script
+COPY <<'EOF' /tests/storage-test.sh
+#!/bin/bash
+# Storage testing script
+
+DEVICE=${1:-/dev/sda}
+
+echo "=== Storage Health Check ==="
+echo "Device: ${DEVICE}"
+echo "Date: $(date)"
+echo
+
+# SMART health check (requires root)
+echo "--- SMART Health Status ---"
+smartctl -H ${DEVICE} 2>/dev/null || echo "smartctl requires root access or device not found"
+echo
+
+# SMART attributes (requires root)
+echo "--- SMART Attributes ---"
+smartctl -A ${DEVICE} 2>/dev/null || echo "smartctl requires root access or device not found"
+echo
+
+# Device information
+echo "--- Device Information ---"
+hdparm -I ${DEVICE} 2>/dev/null || echo "hdparm requires root access or device not found"
+echo
+
+# Read speed test (non-destructive)
+if [ -b "${DEVICE}" ]; then
+    echo "--- Sequential Read Test ---"
+    echo "Note: This test requires root access"
+    hdparm -t ${DEVICE} 2>/dev/null || echo "hdparm requires root access"
+fi
+echo
+
+echo "=== Storage Test Complete ==="
+EOF
+
+# Create network test script
+COPY <<'EOF' /tests/network-test.sh
+#!/bin/bash
+# Network interface testing script
+
+echo "=== Network Interface Test ==="
+echo "Date: $(date)"
+echo
+
+echo "--- Available Interfaces ---"
+ip link show
+echo
+
+for iface in $(ls /sys/class/net/ | grep -v lo); do
+    echo "=== Testing Interface: ${iface} ==="
+    
+    echo "--- Link Status ---"
+    ip link show ${iface}
+    echo
+    
+    echo "--- Interface Details ---"
+    ethtool ${iface} 2>/dev/null || echo "ethtool requires root access"
+    echo
+    
+    echo "--- Speed Test ---"
+    SPEED=$(cat /sys/class/net/${iface}/speed 2>/dev/null)
+    if [ -n "${SPEED}" ] && [ "${SPEED}" != "-1" ]; then
+        echo "Current speed: ${SPEED} Mbps"
+    else
+        echo "Speed information unavailable"
+    fi
+    echo
+done
+
+echo "=== Network Test Complete ==="
+echo
+echo "For throughput testing, use: iperf3 -s (server) and iperf3 -c <server-ip> (client)"
+EOF
+
+# Create comprehensive test runner
+COPY <<'EOF' /tests/run-all-tests.sh
+#!/bin/bash
+# Run all hardware compatibility tests
+
+OUTPUT_DIR="/tests/results"
+mkdir -p ${OUTPUT_DIR}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+echo "========================================="
+echo "Hardware Compatibility Test Suite"
+echo "========================================="
+echo "Start: $(date)"
+echo "Output directory: ${OUTPUT_DIR}"
+echo
+
+# Basic hardware detection
+echo "Running hardware detection..."
+bash /tests/hardware-check.sh | tee ${OUTPUT_DIR}/hardware-check_${TIMESTAMP}.txt
+
+# CPU stress test (short version - 5 minutes)
+echo
+echo "Running CPU stress test (5 minutes)..."
+bash /tests/cpu-stress-test.sh 300 | tee ${OUTPUT_DIR}/cpu-stress_${TIMESTAMP}.txt
+
+# Memory test (256MB, 3 iterations)
+echo
+echo "Running memory test..."
+bash /tests/memory-test.sh 256 3 | tee ${OUTPUT_DIR}/memory-test_${TIMESTAMP}.txt
+
+# Network test
+echo
+echo "Running network interface test..."
+bash /tests/network-test.sh | tee ${OUTPUT_DIR}/network-test_${TIMESTAMP}.txt
+
+# Storage test (if device specified)
+if [ -n "$1" ]; then
+    echo
+    echo "Running storage test on $1..."
+    bash /tests/storage-test.sh $1 | tee ${OUTPUT_DIR}/storage-test_${TIMESTAMP}.txt
+fi
+
+echo
+echo "========================================="
+echo "All tests complete!"
+echo "End: $(date)"
+echo "Results saved in: ${OUTPUT_DIR}"
+echo "========================================="
+EOF
+
+# Make all scripts executable
+RUN chmod +x /tests/*.sh
+
+# Set default command
+CMD ["/bin/bash"]
